@@ -1,0 +1,1014 @@
+#!/usr/bin/env bash
+# wsc - Windsurf Cascade CLI
+# Send prompts to Windsurf Cascade from the terminal with LLM model selection
+
+set -euo pipefail
+
+WSC_DIR="${WSC_DIR:-$HOME/.windsurf-cli}"
+PROMPT_FILE="$WSC_DIR/prompt.json"
+STATUS_FILE="$WSC_DIR/status.json"
+RESPONSE_FILE="$WSC_DIR/response.json"
+MODELS_FILE="$WSC_DIR/models.json"
+WINDOWS_FILE="$WSC_DIR/windows.json"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+DIM='\033[2m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+VERSION="0.1.0"
+
+usage() {
+  cat <<EOF
+${BOLD}wsc${NC} - Windsurf Cascade CLI v${VERSION}
+
+${BOLD}USAGE:${NC}
+  wsc [OPTIONS] [PROMPT]
+  wsc --exec COMMAND_ID [--args JSON]
+  echo "prompt" | wsc
+  wsc -i
+
+${BOLD}OPTIONS:${NC}
+  -m, --model MODEL    Select LLM model (e.g. "Claude 4 Sonnet", "GPT-4o")
+                       Use alone (no prompt) to just switch the model
+  -a, --accept         Auto-accept all Cascade code changes after response
+  -A, --accept-all     Click the Cascade "Accept all" button once (one-shot)
+  -W, --window NAME    Target a specific Windsurf window (by name or workspace)
+  -N, --new-window [DIR] Open a new Windsurf window (default: current directory)
+                       Can combine with prompt: wsc -N ~/proj "fix bug"
+  -n, --new            Start a new Cascade conversation (default: reuse existing)
+  -V, --verbose        Increase stdout detail (repeat for more detail)
+  -l, --list-models    List available models
+  --windows            List open Windsurf windows
+  --tabs               List open Cascade conversations
+  -i, --interactive    Interactive mode (multi-line, Ctrl+D to send)
+  -f, --file FILE      Send contents of a file as the prompt
+  -w, --wait           Wait for completion (response for prompts, processing for --exec)
+  -t, --timeout SEC    Timeout for --wait (default: 120)
+  -s, --status         Show current status
+  -c, --commands       Show discovered Windsurf commands
+  -x, --exec CMD       Execute an arbitrary Windsurf/VS Code command by ID
+      --args JSON      JSON array of arguments for --exec (default: [])
+  -L, --log            Show extension diagnostic log (which strategies worked)
+  -h, --help           Show this help
+  -v, --version        Show version
+
+${BOLD}EXAMPLES:${NC}
+  wsc "explain this codebase"
+  wsc -m "Claude 4 Sonnet" "refactor the auth module"
+  wsc -W myproject "fix the login bug"
+  wsc --windows
+  wsc -f prompt.txt
+  echo "fix the bug in main.py" | wsc
+  wsc -i -m "GPT-4o"
+  wsc -w "add unit tests for utils.js"
+  wsc -V -w "summarize the latest changes"
+  wsc --exec windsurf.cascadePanel.focus
+  wsc -V --exec windsurf.cascade.toggleModelSelector -w
+  wsc -N ~/projects/myapp              # open new window at directory
+  wsc -N . "fix the login bug"          # new window here + send prompt
+  wsc --exec windsurf.openGenericUrl --args '["https://docs.windsurf.com"]'
+
+${BOLD}MODELS:${NC}
+  Run 'wsc -l' to see available models.
+
+${BOLD}SETUP:${NC}
+  1. Install the Cascade CLI Bridge extension in Windsurf
+  2. The extension auto-starts and watches ~/.windsurf-cli/
+  3. Use 'wsc' from any terminal to send prompts
+
+EOF
+}
+
+ensure_dir() {
+  mkdir -p "$WSC_DIR"
+}
+
+verbose() {
+  if [[ ${VERBOSITY:-0} -ge 1 ]]; then
+    echo -e "$@"
+  fi
+}
+
+verbose2() {
+  if [[ ${VERBOSITY:-0} -ge 2 ]]; then
+    echo -e "$@"
+  fi
+}
+
+show_request_paths() {
+  verbose "${BLUE}ℹ${NC} Request directory: ${DIM}${WSC_DIR}${NC}"
+  verbose2 "${DIM}prompt.json: ${PROMPT_FILE}${NC}"
+  verbose2 "${DIM}status.json: ${STATUS_FILE}${NC}"
+  verbose2 "${DIM}response.json: ${RESPONSE_FILE}${NC}"
+}
+
+show_payload_preview() {
+  local kind="$1"
+  local body="$2"
+  local limit="${3:-160}"
+  if [[ ${VERBOSITY:-0} -lt 1 ]]; then
+    return
+  fi
+
+  local preview="$body"
+  if [[ ${#preview} -gt $limit ]]; then
+    preview="${preview:0:limit}..."
+  fi
+  preview="${preview//$'\n'/\\n}"
+  verbose "${BLUE}ℹ${NC} ${kind}: ${DIM}${preview}${NC}"
+}
+
+read_status_snapshot() {
+  if [[ ! -f "$STATUS_FILE" ]]; then
+    return
+  fi
+
+  if command -v python3 &>/dev/null; then
+    python3 - <<'PYEOF' 2>/dev/null
+import json, os
+path = os.environ["STATUS_FILE"]
+with open(path) as f:
+    d = json.load(f)
+print("\t".join([
+    str(d.get("status", "")),
+    str(d.get("message", "")),
+    str(d.get("timestamp", "")),
+    str(d.get("window", "")),
+]))
+PYEOF
+  else
+    cat "$STATUS_FILE"
+  fi
+}
+
+print_status_transition() {
+  local snapshot="$1"
+  [[ -z "$snapshot" ]] && return
+
+  if [[ "$snapshot" == *$'\t'* ]]; then
+    local status message timestamp window
+    IFS=$'\t' read -r status message timestamp window <<< "$snapshot"
+    verbose "${BLUE}→${NC} status=${BOLD}${status:-unknown}${NC} ${DIM}${message}${NC}"
+    verbose2 "${DIM}timestamp=${timestamp} window=${window}${NC}"
+  elif [[ ${VERBOSITY:-0} -ge 1 ]]; then
+    echo "$snapshot"
+  fi
+}
+
+read_prompt_processing_snapshot() {
+  if [[ ! -f "$PROMPT_FILE" ]] || ! command -v python3 &>/dev/null; then
+    return
+  fi
+
+  python3 - <<'PYEOF' 2>/dev/null
+import json, os
+path = os.environ["PROMPT_FILE"]
+with open(path) as f:
+    d = json.load(f)
+
+result = d.get("result", None)
+if result is None:
+    result_str = ""
+elif isinstance(result, (dict, list)):
+    result_str = json.dumps(result)
+else:
+    result_str = str(result)
+
+print("\t".join([
+    "1" if d.get("processed") else "0",
+    "1" if d.get("success") else "0",
+    str(d.get("processedAt", "")),
+    str(d.get("processedBy", "")),
+    str(d.get("error", "")),
+    result_str,
+    str(d.get("command", "")),
+    "1" if d.get("modelOnly") else "0",
+]))
+PYEOF
+}
+
+print_command_result() {
+  if [[ ! -f "$PROMPT_FILE" ]] || ! command -v python3 &>/dev/null; then
+    return
+  fi
+
+  python3 - <<'PYEOF' 2>/dev/null
+import json, os
+path = os.environ["PROMPT_FILE"]
+with open(path) as f:
+    d = json.load(f)
+
+result = d.get("result", None)
+if result is None:
+    raise SystemExit(0)
+
+if isinstance(result, (dict, list)):
+    print(json.dumps(result, indent=2))
+else:
+    print(result)
+PYEOF
+}
+
+list_models() {
+  if [[ -f "$MODELS_FILE" ]]; then
+    echo -e "${BOLD}Available Models:${NC}"
+    echo ""
+    # Parse JSON and display models
+    if command -v python3 &>/dev/null; then
+      python3 -c "
+import json
+with open('$MODELS_FILE') as f:
+    data = json.load(f)
+for i, m in enumerate(data.get('models', []), 1):
+    print(f'  {i:2d}. {m}')
+"
+    elif command -v jq &>/dev/null; then
+      jq -r '.models[] | "  • \(.)"' "$MODELS_FILE"
+    else
+      cat "$MODELS_FILE"
+    fi
+    echo ""
+  else
+    echo -e "${YELLOW}No models file found. Is the Cascade CLI extension running in Windsurf?${NC}"
+    echo -e "${DIM}Default models: SWE-1.5, Claude 4 Sonnet, GPT-4o, Gemini 2.5 Pro${NC}"
+  fi
+}
+
+show_status() {
+  if [[ -f "$STATUS_FILE" ]]; then
+    if command -v python3 &>/dev/null; then
+      python3 -c "
+import json
+with open('$STATUS_FILE') as f:
+    d = json.load(f)
+status = d.get('status', 'unknown')
+icons = {'watching': '👀', 'processing': '⏳', 'sent': '✅', 'error': '❌', 'stopped': '⏹'}
+icon = icons.get(status, '❓')
+print(f'{icon}  Status: {status}')
+print(f'   Message: {d.get(\"message\", \"\")}')
+print(f'   Time: {d.get(\"timestamp\", \"\")}')
+"
+    else
+      cat "$STATUS_FILE"
+    fi
+  else
+    echo -e "${YELLOW}No status file found. Is the Cascade CLI extension running?${NC}"
+  fi
+}
+
+show_windows() {
+  if [[ -f "$WINDOWS_FILE" ]]; then
+    echo -e "${BOLD}Open Windsurf Windows:${NC}"
+    echo ""
+    if command -v python3 &>/dev/null; then
+      python3 -c "
+import json
+with open('$WINDOWS_FILE') as f:
+    data = json.load(f)
+for name, info in data.items():
+    ws = info.get('workspace', 'unknown')
+    ts = info.get('registeredAt', '')
+    print(f'  {name}')
+    print(f'    workspace: {ws}')
+    print(f'    registered: {ts}')
+    print()
+"
+    else
+      cat "$WINDOWS_FILE"
+    fi
+    echo -e "${DIM}Use: wsc -W <name> \"prompt\"${NC}"
+  else
+    echo -e "${YELLOW}No windows registered. Is the Cascade CLI extension running?${NC}"
+  fi
+}
+
+show_tabs() {
+  local tabs_file="$WSC_DIR/tabs.json"
+  if [[ -f "$tabs_file" ]]; then
+    echo -e "${BOLD}Cascade Conversations:${NC}"
+    echo ""
+    if command -v python3 &>/dev/null; then
+      python3 -c "
+import json
+with open('$tabs_file') as f:
+    data = json.load(f)
+print(f'  Window: {data.get(\"window\", \"unknown\")}')
+print(f'  Updated: {data.get(\"timestamp\", \"\")}')
+print()
+active = data.get('activeConversation')
+if active:
+    print(f'  Active conversation:')
+    print(f'    #{active[\"id\"]} — model: {active.get(\"model\", \"?\")}')
+    print(f'    Opened: {active.get(\"openedAt\", \"?\")}')
+    print(f'    Prompts sent: {active.get(\"promptCount\", 0)}')
+    print(f'    Last prompt: {active.get(\"lastPromptAt\", \"never\")}')
+else:
+    print('  No active conversation')
+print()
+convs = data.get('conversations', [])
+if len(convs) > 1:
+    print(f'  All conversations ({len(convs)}):')
+    for c in convs:
+        marker = ' ← active' if c == convs[-1] else ''
+        print(f'    #{c[\"id\"]} model={c.get(\"model\",\"?\")} prompts={c.get(\"promptCount\",0)}{marker}')
+"
+    else
+      cat "$tabs_file"
+    fi
+  else
+    echo -e "${YELLOW}No conversation data yet. Send a prompt first.${NC}"
+  fi
+}
+
+show_log() {
+  local log_file="$WSC_DIR/extension.log"
+  if [[ -f "$log_file" ]]; then
+    echo -e "${BOLD}Extension Diagnostic Log:${NC}"
+    echo ""
+    tail -50 "$log_file"
+    echo ""
+    echo -e "${DIM}Full log: $log_file${NC}"
+    echo -e "${DIM}In Windsurf: View > Output > Cascade CLI${NC}"
+  else
+    echo -e "${YELLOW}No log file yet. Send a prompt first, or restart Windsurf.${NC}"
+  fi
+}
+
+show_commands() {
+  local cmds_file="$WSC_DIR/available-commands.json"
+  if [[ -f "$cmds_file" ]]; then
+    echo -e "${BOLD}Discovered Windsurf/Cascade Commands:${NC}"
+    echo ""
+    if command -v python3 &>/dev/null; then
+      python3 -c "
+import json
+with open('$cmds_file') as f:
+    data = json.load(f)
+for cmd in sorted(data.get('commands', [])):
+    print(f'  {cmd}')
+"
+    elif command -v jq &>/dev/null; then
+      jq -r '.commands[]' "$cmds_file" | sort | sed 's/^/  /'
+    else
+      cat "$cmds_file"
+    fi
+    echo ""
+  else
+    echo -e "${YELLOW}No commands discovered yet. The extension will populate this on startup.${NC}"
+  fi
+}
+
+select_model_interactive() {
+  if [[ ! -f "$MODELS_FILE" ]]; then
+    echo ""
+    return
+  fi
+
+  echo -e "${BOLD}Select a model:${NC}"
+  local models=()
+  if command -v python3 &>/dev/null; then
+    while IFS= read -r line; do
+      models+=("$line")
+    done < <(python3 -c "
+import json
+with open('$MODELS_FILE') as f:
+    data = json.load(f)
+for m in data.get('models', []):
+    print(m)
+")
+  fi
+
+  if [[ ${#models[@]} -eq 0 ]]; then
+    echo ""
+    return
+  fi
+
+  for i in "${!models[@]}"; do
+    echo -e "  ${CYAN}$((i+1))${NC}) ${models[$i]}"
+  done
+  echo -e "  ${DIM}0) No preference (use current)${NC}"
+  echo ""
+
+  read -rp "Model [0]: " choice
+  choice="${choice:-0}"
+
+  if [[ "$choice" == "0" ]]; then
+    echo ""
+    return
+  fi
+
+  if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le "${#models[@]}" ]]; then
+    echo "${models[$((choice-1))]}"
+  else
+    echo -e "${RED}Invalid choice${NC}" >&2
+    echo ""
+  fi
+}
+
+open_new_window() {
+  local dir="$1"
+  local wait_for_ready="${2:-true}"
+
+  # Resolve to absolute path
+  if [[ "$dir" != /* ]]; then
+    dir="$(cd "$dir" 2>/dev/null && pwd)" || {
+      echo -e "${RED}Directory not found: $1${NC}" >&2
+      return 1
+    }
+  fi
+
+  if [[ ! -d "$dir" ]]; then
+    echo -e "${RED}Not a directory: $dir${NC}" >&2
+    return 1
+  fi
+
+  echo -e "${CYAN}⧉${NC} Opening new Windsurf window..."
+  echo -e "  ${DIM}Directory: ${dir}${NC}"
+
+  # Try windsurf CLI first (most reliable)
+  if command -v windsurf &>/dev/null; then
+    verbose "${BLUE}ℹ${NC} Using: windsurf CLI"
+    windsurf "$dir" &>/dev/null &
+  elif [[ "$(uname)" == "Darwin" ]]; then
+    # macOS: use open command
+    verbose "${BLUE}ℹ${NC} Using: open -na Windsurf"
+    open -na "Windsurf" --args "$dir"
+  else
+    # Try code/windsurf-like CLI names
+    local found=false
+    for cli_name in windsurf-next windsurf-insiders code; do
+      if command -v "$cli_name" &>/dev/null; then
+        verbose "${BLUE}ℹ${NC} Using: $cli_name CLI"
+        "$cli_name" "$dir" &>/dev/null &
+        found=true
+        break
+      fi
+    done
+    if [[ "$found" == false ]]; then
+      echo -e "${RED}Cannot open new window: no Windsurf CLI found${NC}" >&2
+      echo -e "${DIM}Install the 'windsurf' CLI or add it to PATH${NC}" >&2
+      return 1
+    fi
+  fi
+
+  if [[ "$wait_for_ready" == "true" ]]; then
+    # Wait for the new window to register in windows.json
+    local window_name
+    window_name=$(basename "$dir")
+    echo -e "  ${DIM}Waiting for window '${window_name}' to register...${NC}"
+
+    local elapsed=0
+    local max_wait=30
+    while [[ $elapsed -lt $max_wait ]]; do
+      if [[ -f "$WINDOWS_FILE" ]] && command -v python3 &>/dev/null; then
+        local registered
+        registered=$(WSC_WINDOWS_FILE="$WINDOWS_FILE" WSC_WINDOW_NAME="$window_name" python3 -c "
+import json, os
+with open(os.environ['WSC_WINDOWS_FILE']) as f:
+    data = json.load(f)
+name = os.environ['WSC_WINDOW_NAME']
+print('yes' if name in data else 'no')
+" 2>/dev/null || echo "no")
+        if [[ "$registered" == "yes" ]]; then
+          echo -e "${GREEN}✓${NC} Window '${window_name}' is ready"
+          # Set WINDOW so subsequent prompt targets this window
+          WINDOW="$window_name"
+          return 0
+        fi
+      fi
+      sleep 1
+      elapsed=$((elapsed + 1))
+      printf "\r  ${DIM}Elapsed: %ds${NC}  " "$elapsed"
+    done
+
+    echo ""
+    echo -e "${YELLOW}⚠${NC} Window opened but not yet registered (may still be loading)"
+    echo -e "  ${DIM}The extension needs to be active in the new window${NC}"
+    WINDOW="$window_name"
+  fi
+
+  return 0
+}
+
+send_prompt() {
+  local prompt="$1"
+  local model="${2:-}"
+  local window="${3:-}"
+  local new_conv="${4:-false}"
+  local auto_accept="${5:-false}"
+  local model_only="${6:-false}"
+
+  ensure_dir
+
+  # Build JSON payload using Python (safe for any prompt content)
+  if command -v python3 &>/dev/null; then
+    local tmp_prompt
+    tmp_prompt=$(mktemp)
+    printf '%s' "$prompt" > "$tmp_prompt"
+    WSC_MODEL="$model" WSC_WINDOW="$window" WSC_WORKSPACE="$PWD" \
+    WSC_NEW_CONV="$new_conv" WSC_AUTO_ACCEPT="$auto_accept" \
+    WSC_MODEL_ONLY="$model_only" \
+    WSC_PROMPT_FILE="$PROMPT_FILE" WSC_TMP="$tmp_prompt" python3 << 'PYEOF' 2>/dev/null
+import json, os
+from datetime import datetime
+
+with open(os.environ["WSC_TMP"]) as f:
+    prompt_text = f.read()
+
+model = os.environ.get("WSC_MODEL", "")
+window = os.environ.get("WSC_WINDOW", "")
+workspace = os.environ.get("WSC_WORKSPACE", "")
+new_conv = os.environ.get("WSC_NEW_CONV", "false") == "true"
+auto_accept = os.environ.get("WSC_AUTO_ACCEPT", "false") == "true"
+model_only = os.environ.get("WSC_MODEL_ONLY", "false") == "true"
+prompt_file = os.environ["WSC_PROMPT_FILE"]
+
+data = {
+    "timestamp": datetime.now().isoformat(),
+    "source": "cli",
+    "processed": False,
+}
+if prompt_text:
+    data["prompt"] = prompt_text
+if model:
+    data["model"] = model
+if window:
+    data["window"] = window
+if workspace:
+    data["workspace"] = workspace
+if new_conv:
+    data["newConversation"] = True
+if auto_accept:
+    data["autoAccept"] = True
+if model_only:
+    data["modelOnly"] = True
+
+with open(prompt_file, "w") as f:
+    json.dump(data, f, indent=2)
+PYEOF
+    local py_exit=$?
+    rm -f "$tmp_prompt"
+    if [[ $py_exit -ne 0 ]]; then
+      write_prompt_json "$prompt" "$model"
+    fi
+  else
+    write_prompt_json "$prompt" "$model"
+  fi
+
+  if [[ "$model_only" == "true" ]]; then
+    echo -e "${GREEN}✓${NC} Model selection sent"
+    echo -e "  ${DIM}Model: ${model}${NC}"
+    show_request_paths
+  else
+    echo -e "${GREEN}✓${NC} Prompt sent to Cascade"
+    [[ -n "$model" ]] && echo -e "  ${DIM}Model: ${model}${NC}"
+    [[ "$auto_accept" == "true" ]] && echo -e "  ${DIM}Auto-accept: enabled${NC}"
+    show_request_paths
+    show_payload_preview "Prompt preview" "$prompt"
+  fi
+  [[ -n "$window" ]] && echo -e "  ${DIM}Window: ${window}${NC}"
+  echo -e "  ${DIM}Waiting for extension to pick it up...${NC}"
+}
+
+execute_command() {
+  local command_id="$1"
+  local args_json="${2:-[]}"
+  local window="${3:-}"
+
+  ensure_dir
+
+  if command -v python3 &>/dev/null; then
+    WSC_COMMAND="$command_id" WSC_ARGS_JSON="$args_json" WSC_WINDOW="$window" \
+    WSC_WORKSPACE="$PWD" WSC_PROMPT_FILE="$PROMPT_FILE" python3 << 'PYEOF' 2>/dev/null
+import json, os
+from datetime import datetime
+
+command_id = os.environ.get("WSC_COMMAND", "")
+args_json = os.environ.get("WSC_ARGS_JSON", "[]")
+window = os.environ.get("WSC_WINDOW", "")
+workspace = os.environ.get("WSC_WORKSPACE", "")
+prompt_file = os.environ["WSC_PROMPT_FILE"]
+
+try:
+    args = json.loads(args_json) if args_json else []
+except Exception as exc:
+    raise SystemExit(f"Invalid JSON for --args: {exc}")
+
+if not isinstance(args, list):
+    raise SystemExit("Invalid JSON for --args: expected a JSON array")
+
+data = {
+    "command": command_id,
+    "args": args,
+    "timestamp": datetime.now().isoformat(),
+    "source": "cli",
+    "processed": False,
+}
+if window:
+    data["window"] = window
+if workspace:
+    data["workspace"] = workspace
+
+with open(prompt_file, "w") as f:
+    json.dump(data, f, indent=2)
+PYEOF
+    local py_exit=$?
+    if [[ $py_exit -ne 0 ]]; then
+      echo -e "${RED}Failed to build command payload. Check your --args JSON.${NC}" >&2
+      exit 1
+    fi
+  else
+    echo -e "${RED}python3 is required for --exec with --args JSON${NC}" >&2
+    exit 1
+  fi
+
+  echo -e "${GREEN}✓${NC} Command sent to Windsurf"
+  echo -e "  ${DIM}Command: ${command_id}${NC}"
+  echo -e "  ${DIM}Args: ${args_json}${NC}"
+  show_request_paths
+  show_payload_preview "Args preview" "$args_json"
+  [[ -n "$window" ]] && echo -e "  ${DIM}Window: ${window}${NC}"
+  echo -e "  ${DIM}Waiting for extension to pick it up...${NC}"
+}
+
+write_prompt_json() {
+  local prompt="$1"
+  local model="$2"
+  local timestamp
+  timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+  # Escape for JSON
+  local escaped_prompt
+  escaped_prompt=$(echo "$prompt" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g' | tr '\n' '\\' | sed 's/\\/\\n/g')
+
+  local model_field=""
+  if [[ -n "$model" ]]; then
+    model_field="\"model\": \"$model\","
+  fi
+
+  cat > "$PROMPT_FILE" <<ENDJSON
+{
+  "prompt": "$escaped_prompt",
+  ${model_field}
+  "timestamp": "$timestamp",
+  "source": "cli",
+  "processed": false
+}
+ENDJSON
+}
+
+wait_for_response() {
+  local timeout="${1:-120}"
+  local start_time
+  start_time=$(date +%s)
+  local last_status=""
+
+  echo -e "${DIM}Waiting for Cascade response (timeout: ${timeout}s)...${NC}"
+
+  while true; do
+    local now
+    now=$(date +%s)
+    local elapsed=$((now - start_time))
+
+    if [[ $elapsed -ge $timeout ]]; then
+      echo -e "${YELLOW}⏰ Timed out waiting for response${NC}"
+      return 1
+    fi
+
+    local status_snapshot
+    status_snapshot=$(STATUS_FILE="$STATUS_FILE" read_status_snapshot || true)
+    if [[ -n "$status_snapshot" && "$status_snapshot" != "$last_status" ]]; then
+      echo ""
+      print_status_transition "$status_snapshot"
+      last_status="$status_snapshot"
+
+      if [[ "$status_snapshot" == error$'\t'* ]]; then
+        echo -e "${RED}✗${NC} Extension reported an error while waiting for a response"
+        return 1
+      fi
+    fi
+
+    if [[ -f "$RESPONSE_FILE" ]]; then
+      local resp_time=""
+      if command -v python3 &>/dev/null; then
+        resp_time=$(python3 -c "
+import json
+with open('$RESPONSE_FILE') as f:
+    d = json.load(f)
+print(d.get('timestamp', ''))
+" 2>/dev/null || echo "")
+      fi
+
+      if [[ -n "$resp_time" ]]; then
+        echo ""
+        echo -e "${GREEN}━━━ Cascade Response ━━━${NC}"
+        if command -v python3 &>/dev/null; then
+          python3 -c "
+import json
+with open('$RESPONSE_FILE') as f:
+    d = json.load(f)
+print(d.get('response', 'No response content'))
+"
+        else
+          cat "$RESPONSE_FILE"
+        fi
+        echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        return 0
+      fi
+    fi
+
+    sleep 1
+    printf "\r  ${DIM}Elapsed: %ds${NC}  " "$elapsed"
+  done
+}
+
+wait_for_processing() {
+  local timeout="${1:-120}"
+  local label="${2:-request}"
+  local start_time
+  local last_status=""
+  start_time=$(date +%s)
+
+  echo -e "${DIM}Waiting for ${label} to complete (timeout: ${timeout}s)...${NC}"
+
+  while true; do
+    local now
+    now=$(date +%s)
+    local elapsed=$((now - start_time))
+
+    if [[ $elapsed -ge $timeout ]]; then
+      echo -e "${YELLOW}⏰ Timed out waiting for ${label}${NC}"
+      return 1
+    fi
+
+    local status_snapshot
+    status_snapshot=$(STATUS_FILE="$STATUS_FILE" read_status_snapshot || true)
+    if [[ -n "$status_snapshot" && "$status_snapshot" != "$last_status" ]]; then
+      echo ""
+      print_status_transition "$status_snapshot"
+      last_status="$status_snapshot"
+    fi
+
+    local processing_snapshot
+    processing_snapshot=$(PROMPT_FILE="$PROMPT_FILE" read_prompt_processing_snapshot || true)
+    if [[ -n "$processing_snapshot" ]]; then
+      local processed success processed_at processed_by error result command model_only
+      IFS=$'\t' read -r processed success processed_at processed_by error result command model_only <<< "$processing_snapshot"
+
+      if [[ "$processed" == "1" ]]; then
+        echo ""
+        if [[ "$success" == "1" ]]; then
+          if [[ -n "$command" ]]; then
+            echo -e "${GREEN}✓${NC} Command completed"
+            echo -e "  ${DIM}Command: ${command}${NC}"
+          elif [[ "$model_only" == "1" ]]; then
+            echo -e "${GREEN}✓${NC} Model selection completed"
+          else
+            echo -e "${GREEN}✓${NC} Request accepted by extension"
+          fi
+          [[ -n "$processed_by" ]] && verbose "${BLUE}ℹ${NC} Processed by window: ${processed_by}"
+          [[ -n "$processed_at" ]] && verbose2 "${DIM}Processed at: ${processed_at}${NC}"
+          if [[ -n "$result" ]]; then
+            echo -e "${BLUE}Result:${NC}"
+            print_command_result
+          fi
+          return 0
+        fi
+
+        echo -e "${RED}✗${NC} ${label} failed"
+        [[ -n "$command" ]] && echo -e "  ${DIM}Command: ${command}${NC}"
+        [[ -n "$error" ]] && echo -e "  ${RED}${error}${NC}"
+        [[ -n "$processed_by" ]] && verbose "${BLUE}ℹ${NC} Processed by window: ${processed_by}"
+        return 1
+      fi
+    fi
+
+    sleep 1
+    printf "\r  ${DIM}Elapsed: %ds${NC}  " "$elapsed"
+  done
+}
+
+# --- Main ---
+
+MODEL=""
+WINDOW=""
+NEW_WINDOW_DIR=""
+NEW_CONVERSATION=false
+AUTO_ACCEPT=false
+WAIT=false
+TIMEOUT=120
+INTERACTIVE=false
+FILE_INPUT=""
+EXEC_COMMAND=""
+EXEC_ARGS='[]'
+ACCEPT_ALL_ONCE=false
+VERBOSITY=0
+PROMPT_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -v|--version)
+      echo "wsc v${VERSION}"
+      exit 0
+      ;;
+    -m|--model)
+      MODEL="$2"
+      shift 2
+      ;;
+    -W|--window)
+      WINDOW="$2"
+      shift 2
+      ;;
+    -N|--new-window)
+      if [[ $# -gt 1 && ! "$2" =~ ^- ]]; then
+        NEW_WINDOW_DIR="$2"
+        shift 2
+      else
+        NEW_WINDOW_DIR="$PWD"
+        shift
+      fi
+      ;;
+    --windows)
+      show_windows
+      exit 0
+      ;;
+    --tabs)
+      show_tabs
+      exit 0
+      ;;
+    -a|--accept)
+      AUTO_ACCEPT=true
+      shift
+      ;;
+    -A|--accept-all)
+      ACCEPT_ALL_ONCE=true
+      WAIT=true
+      shift
+      ;;
+    -n|--new)
+      NEW_CONVERSATION=true
+      shift
+      ;;
+    -V|--verbose)
+      VERBOSITY=$((VERBOSITY + 1))
+      shift
+      ;;
+    -l|--list-models)
+      list_models
+      exit 0
+      ;;
+    -i|--interactive)
+      INTERACTIVE=true
+      shift
+      ;;
+    -f|--file)
+      FILE_INPUT="$2"
+      shift 2
+      ;;
+    -w|--wait)
+      WAIT=true
+      shift
+      ;;
+    -t|--timeout)
+      TIMEOUT="$2"
+      shift 2
+      ;;
+    -s|--status)
+      show_status
+      exit 0
+      ;;
+    -c|--commands)
+      show_commands
+      exit 0
+      ;;
+    -x|--exec)
+      EXEC_COMMAND="$2"
+      shift 2
+      ;;
+    --args)
+      EXEC_ARGS="$2"
+      shift 2
+      ;;
+    -L|--log)
+      show_log
+      exit 0
+      ;;
+    --)
+      shift
+      PROMPT_ARGS+=("$@")
+      break
+      ;;
+    -*)
+      echo -e "${RED}Unknown option: $1${NC}" >&2
+      echo "Run 'wsc --help' for usage" >&2
+      exit 1
+      ;;
+    *)
+      PROMPT_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+ensure_dir
+
+# Handle --new-window: open new Windsurf window first
+if [[ -n "$NEW_WINDOW_DIR" ]]; then
+  open_new_window "$NEW_WINDOW_DIR" || exit 1
+  # If no prompt/command follows, we're done
+  if [[ ${#PROMPT_ARGS[@]} -eq 0 && -z "$FILE_INPUT" && -t 0 && "$INTERACTIVE" != true && -z "$EXEC_COMMAND" && -z "$MODEL" ]]; then
+    exit 0
+  fi
+  # Force new conversation in the new window
+  NEW_CONVERSATION=true
+fi
+
+if [[ "$ACCEPT_ALL_ONCE" == true ]]; then
+  rm -f "$RESPONSE_FILE"
+  execute_command "cascadeCli.acceptAllOnce" "[]" "$WINDOW"
+  wait_for_processing "$TIMEOUT" "accept all" || exit 1
+  exit 0
+fi
+
+if [[ -n "$EXEC_COMMAND" ]]; then
+  rm -f "$RESPONSE_FILE"
+  execute_command "$EXEC_COMMAND" "$EXEC_ARGS" "$WINDOW"
+  if [[ "$WAIT" == true ]]; then
+    wait_for_processing "$TIMEOUT" "command execution" || exit 1
+  fi
+  exit 0
+fi
+
+# Determine the prompt source
+PROMPT=""
+
+if [[ -n "$FILE_INPUT" ]]; then
+  # Read from file
+  if [[ ! -f "$FILE_INPUT" ]]; then
+    echo -e "${RED}File not found: $FILE_INPUT${NC}" >&2
+    exit 1
+  fi
+  PROMPT=$(cat "$FILE_INPUT")
+elif [[ ${#PROMPT_ARGS[@]} -gt 0 ]]; then
+  # From arguments
+  PROMPT="${PROMPT_ARGS[*]}"
+elif [[ ! -t 0 ]]; then
+  # From stdin (pipe)
+  PROMPT=$(cat)
+elif [[ "$INTERACTIVE" == true ]]; then
+  # Interactive mode
+  echo -e "${BOLD}Cascade CLI - Interactive Mode${NC}"
+  echo -e "${DIM}Type your prompt (Ctrl+D to send, Ctrl+C to cancel)${NC}"
+
+  # Model selection if not provided
+  if [[ -z "$MODEL" ]]; then
+    selected=$(select_model_interactive)
+    if [[ -n "$selected" ]]; then
+      MODEL="$selected"
+      echo -e "${DIM}Selected: ${MODEL}${NC}"
+    fi
+  fi
+
+  echo ""
+  echo -e "${CYAN}─── Enter prompt ───${NC}"
+  PROMPT=$(cat)
+  echo -e "${CYAN}────────────────────${NC}"
+else
+  # No input provided — check if model-only mode
+  if [[ -n "$MODEL" ]]; then
+    # Model-only: just switch the model, no prompt needed
+    rm -f "$RESPONSE_FILE"
+    send_prompt "" "$MODEL" "$WINDOW" "$NEW_CONVERSATION" "$AUTO_ACCEPT" "true"
+    if [[ "$WAIT" == true ]]; then
+      wait_for_processing "$TIMEOUT" "model selection" || exit 1
+    fi
+    exit 0
+  fi
+  usage
+  exit 0
+fi
+
+if [[ -z "$PROMPT" ]]; then
+  echo -e "${RED}Empty prompt${NC}" >&2
+  exit 1
+fi
+
+# Remove response file before sending
+rm -f "$RESPONSE_FILE"
+
+send_prompt "$PROMPT" "$MODEL" "$WINDOW" "$NEW_CONVERSATION" "$AUTO_ACCEPT" "false"
+
+if [[ "$WAIT" == true ]]; then
+  wait_for_processing "$TIMEOUT" "prompt dispatch" || exit 1
+  wait_for_response "$TIMEOUT"
+fi

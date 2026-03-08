@@ -1,0 +1,10 @@
+{
+  "hooks": {
+    "post_cascade_response": [
+      {
+        "command": "bash HOOKS_DIR/response-capture.sh",
+        "show_output": false
+      }
+    ]
+  }
+}

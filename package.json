@@ -1,0 +1,56 @@
+{
+  "name": "cascade-cli",
+  "displayName": "Cascade CLI Bridge",
+  "description": "Enables terminal/CLI access to Windsurf Cascade with LLM model selection",
+  "version": "0.1.0",
+  "publisher": "windsurf-cli",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./src/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "cascadeCli.sendPrompt",
+        "title": "Cascade CLI: Send Prompt"
+      },
+      {
+        "command": "cascadeCli.executeCommand",
+        "title": "Cascade CLI: Execute Arbitrary Command"
+      },
+      {
+        "command": "cascadeCli.startWatching",
+        "title": "Cascade CLI: Start Watching for Prompts"
+      },
+      {
+        "command": "cascadeCli.stopWatching",
+        "title": "Cascade CLI: Stop Watching for Prompts"
+      },
+      {
+        "command": "cascadeCli.openNewWindow",
+        "title": "Cascade CLI: Open New Window"
+      },
+      {
+        "command": "cascadeCli.showStatus",
+        "title": "Cascade CLI: Show Status"
+      }
+    ],
+    "configuration": {
+      "title": "Cascade CLI",
+      "properties": {
+        "cascadeCli.promptDir": {
+          "type": "string",
+          "default": "",
+          "description": "Directory for prompt files. Defaults to ~/.windsurf-cli/"
+        },
+        "cascadeCli.autoStart": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically start watching for CLI prompts on startup"
+        }
+      }
+    }
+  }
+}
