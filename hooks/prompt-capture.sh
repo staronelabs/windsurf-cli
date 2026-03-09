@@ -101,11 +101,33 @@ except Exception as e:
     log(f"parse error: {e}")
     sys.exit(0)
 
+trajectory_id = data.get("trajectory_id", "")
+execution_id = data.get("execution_id", "")
+timestamp = data.get("timestamp", datetime.utcnow().isoformat() + "Z")
+
+# Write active-conversation.json FIRST so the extension can track trajectory_id
+# (must happen before prompt extraction which may exit early)
+try:
+    conv_data = {
+        "trajectory_id": trajectory_id,
+        "execution_id": execution_id,
+        "window": active_window,
+        "timestamp": timestamp,
+        "source": "pre_user_prompt",
+    }
+    conv_file = os.path.join(wsc_dir, "active-conversation.json")
+    with open(conv_file, "w") as f:
+        json.dump(conv_data, f, indent=2)
+    log(f"wrote active-conversation.json (trajectory={trajectory_id[:8]})")
+except Exception as e:
+    log(f"failed to write active-conversation.json: {e}")
+
 # Extract user prompt text
 prompt_text = ""
 
-# Try tool_info.prompt first
-prompt_text = (data.get("tool_info") or {}).get("prompt", "")
+# Try tool_info.user_prompt first (actual Windsurf field name), then fallbacks
+tool_info = data.get("tool_info") or {}
+prompt_text = tool_info.get("user_prompt", "") or tool_info.get("prompt", "")
 if not prompt_text:
     prompt_text = data.get("prompt", "")
 if not prompt_text:
@@ -118,9 +140,6 @@ if not prompt_text:
     sys.exit(0)
 
 log(f"found prompt ({len(prompt_text)} chars)")
-
-trajectory_id = data.get("trajectory_id", "")
-timestamp = data.get("timestamp", datetime.utcnow().isoformat() + "Z")
 
 # Write per-window prompt file (analogous to response-{window}.json)
 prompt_output = {

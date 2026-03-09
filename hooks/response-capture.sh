@@ -189,6 +189,22 @@ trajectory_id = data.get("trajectory_id", "")
 execution_id = data.get("execution_id", "")
 timestamp = data.get("timestamp", datetime.utcnow().isoformat() + "Z")
 
+# Write active-conversation.json so the extension can track trajectory_id
+try:
+    conv_data = {
+        "trajectory_id": trajectory_id,
+        "execution_id": execution_id,
+        "window": active_window,
+        "timestamp": timestamp,
+        "source": "post_cascade_response",
+    }
+    conv_file = os.path.join(wsc_dir, "active-conversation.json")
+    with open(conv_file, "w") as f:
+        json.dump(conv_data, f, indent=2)
+    log(f"wrote active-conversation.json (trajectory={trajectory_id[:8]})")
+except Exception as e:
+    log(f"failed to write active-conversation.json: {e}")
+
 output = {
     "response": response_text,
     "trajectory_id": trajectory_id,

@@ -176,21 +176,25 @@ function shouldProcessPrompt(data) {
 }
 
 // ---------------------------------------------------------------------------
-// Conversation tracking — track CLI-opened Cascade conversations
+// Conversation tracking — track Cascade conversations with trajectory_id
 // ---------------------------------------------------------------------------
 
 const TABS_FILE = "tabs.json";
-let conversations = []; // { id, openedAt, model, promptCount, lastPromptAt }
+const ACTIVE_CONV_FILE = "active-conversation.json";
+let conversations = []; // { id, trajectoryId, openedAt, model, promptCount, lastPromptAt, source }
 let currentConversationId = 0;
+let activeConversationWatcher = null;
 
-function recordNewConversation(model) {
+function recordNewConversation(model, source = "cli") {
   currentConversationId++;
   const conv = {
     id: currentConversationId,
+    trajectoryId: null,
     openedAt: new Date().toISOString(),
     model: model || "(default)",
     promptCount: 0,
     lastPromptAt: null,
+    source,
   };
   conversations.push(conv);
   writeConversations();
@@ -206,12 +210,96 @@ function recordPromptSent() {
   }
 }
 
+// Called when hooks write active-conversation.json with the real trajectory_id
+function handleActiveConversationUpdate() {
+  try {
+    const filePath = path.join(promptDir, ACTIVE_CONV_FILE);
+    if (!fs.existsSync(filePath)) return;
+    const raw = fs.readFileSync(filePath, "utf-8");
+    const data = JSON.parse(raw);
+    const trajId = data.trajectory_id;
+    const execId = data.execution_id;
+    const hookWindow = data.window;
+    const hookSource = data.source || "";
+
+    if (!trajId) return;
+    // Only process if this update is for our window
+    if (hookWindow && hookWindow !== windowId) return;
+
+    // Find existing conversation with this trajectory_id
+    let conv = conversations.find((c) => c.trajectoryId === trajId);
+
+    if (conv) {
+      // Update existing conversation
+      if (hookSource === "pre_user_prompt") {
+        conv.promptCount++;
+        conv.lastPromptAt = data.timestamp || new Date().toISOString();
+      }
+      conv.lastExecutionId = execId;
+    } else {
+      // New conversation we haven't seen — could be GUI-initiated
+      currentConversationId++;
+      conv = {
+        id: currentConversationId,
+        trajectoryId: trajId,
+        openedAt: data.timestamp || new Date().toISOString(),
+        model: "(default)",
+        promptCount: hookSource === "pre_user_prompt" ? 1 : 0,
+        lastPromptAt: hookSource === "pre_user_prompt" ? (data.timestamp || new Date().toISOString()) : null,
+        lastExecutionId: execId,
+        source: "hook",
+      };
+      conversations.push(conv);
+      _log(`[conv] New conversation from hook: trajectory=${trajId.substring(0, 8)} source=${hookSource}`);
+    }
+
+    // If the most recent CLI-created conversation has no trajectoryId yet, bind it
+    if (!conv.trajectoryId) {
+      conv.trajectoryId = trajId;
+    }
+    // Also check: the latest conversation might need its trajectoryId set
+    const latest = conversations[conversations.length - 1];
+    if (latest && !latest.trajectoryId && latest.source === "cli") {
+      latest.trajectoryId = trajId;
+      latest.lastExecutionId = execId;
+      _log(`[conv] Bound trajectory=${trajId.substring(0, 8)} to CLI conversation #${latest.id}`);
+    }
+
+    writeConversations();
+  } catch (e) {
+    // Ignore parse errors from partial writes
+  }
+}
+
+function startActiveConversationWatcher() {
+  if (activeConversationWatcher) return;
+  const filePath = path.join(promptDir, ACTIVE_CONV_FILE);
+  try {
+    activeConversationWatcher = fs.watch(filePath, { persistent: false }, (eventType) => {
+      if (eventType === "change" || eventType === "rename") {
+        setTimeout(() => handleActiveConversationUpdate(), 100);
+      }
+    });
+    _log("[conv] Watching active-conversation.json for trajectory updates");
+  } catch {
+    // File may not exist yet — we'll create the watcher when it appears
+    // Use a polling fallback: check every 5 seconds
+    const checkInterval = setInterval(() => {
+      if (fs.existsSync(filePath)) {
+        clearInterval(checkInterval);
+        startActiveConversationWatcher();
+      }
+    }, 5000);
+  }
+}
+
 function writeConversations() {
   try {
+    const active = conversations.length > 0 ? conversations[conversations.length - 1] : null;
     const data = {
       window: windowId,
       timestamp: new Date().toISOString(),
-      activeConversation: conversations.length > 0 ? conversations[conversations.length - 1] : null,
+      activeConversation: active,
       conversations,
     };
     fs.writeFileSync(path.join(promptDir, TABS_FILE), JSON.stringify(data, null, 2));
@@ -1100,6 +1188,9 @@ function activate(context) {
     })
   );
 
+  // Watch active-conversation.json for trajectory_id updates from hooks
+  startActiveConversationWatcher();
+
   // Auto-start if configured
   const config = vscode.workspace.getConfiguration("cascadeCli");
   if (config.get("autoStart")) {
@@ -1143,6 +1234,10 @@ function deactivate() {
     // Non-critical
   }
   stopWatching();
+  if (activeConversationWatcher) {
+    activeConversationWatcher.close();
+    activeConversationWatcher = null;
+  }
   if (statusBarItem) statusBarItem.dispose();
 }
 
