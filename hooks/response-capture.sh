@@ -46,6 +46,17 @@ RESPONSE_FILE="$WSC_DIR/response.json"
 STATUS_FILE="$WSC_DIR/status.json"
 HOOK_LOG="$WSC_DIR/hook.log"
 
+# Read active window ID for per-window files
+ACTIVE_WINDOW=""
+if [[ -f "$WSC_DIR/active-window.json" ]] && command -v python3 &>/dev/null; then
+  ACTIVE_WINDOW=$(python3 -c "
+import json
+with open('$WSC_DIR/active-window.json') as f:
+    print(json.load(f).get('windowId', ''))
+" 2>/dev/null || echo "")
+fi
+export ACTIVE_WINDOW
+
 mkdir -p "$WSC_DIR"
 
 # Debug: log every invocation
@@ -77,6 +88,8 @@ wsc_dir = os.environ.get("WSC_DIR", os.path.expanduser("~/.windsurf-cli"))
 response_file = os.path.join(wsc_dir, "response.json")
 status_file = os.path.join(wsc_dir, "status.json")
 hook_log = os.path.join(wsc_dir, "hook.log")
+active_window = os.environ.get("ACTIVE_WINDOW", "")
+window_response_file = os.path.join(wsc_dir, f"response-{active_window}.json") if active_window else None
 
 def log(msg):
     with open(hook_log, "a") as f:
@@ -185,6 +198,12 @@ output = {
 with open(response_file, "w") as f:
     json.dump(output, f, indent=2)
 
+# Also write per-window response file
+if window_response_file:
+    with open(window_response_file, "w") as f:
+        json.dump(output, f, indent=2)
+    log(f"wrote per-window response to {window_response_file}")
+
 log(f"wrote response to {response_file} ({len(response_text)} chars)")
 
 status = {
@@ -194,6 +213,65 @@ status = {
 }
 with open(status_file, "w") as f:
     json.dump(status, f, indent=2)
+
+# --- Append to conversation history ---
+history_file = os.path.join(wsc_dir, "conversation-history.json")
+window_history_file = os.path.join(wsc_dir, f"conversation-history-{active_window}.json") if active_window else None
+try:
+    history = {"messages": []}
+    if os.path.exists(history_file):
+        with open(history_file) as f:
+            history = json.load(f)
+        if "messages" not in history:
+            history["messages"] = []
+
+    history["messages"].append({
+        "role": "cascade",
+        "content": response_text,
+        "timestamp": timestamp,
+        "trajectory_id": trajectory_id,
+        "execution_id": execution_id,
+    })
+
+    # Keep last 200 messages
+    if len(history["messages"]) > 200:
+        history["messages"] = history["messages"][-200:]
+
+    with open(history_file, "w") as f:
+        json.dump(history, f, indent=2)
+
+    log(f"appended cascade response to history ({len(history['messages'])} total)")
+
+    # Also append to per-window history
+    if window_history_file:
+        try:
+            win_history = {"messages": [], "window": active_window}
+            if os.path.exists(window_history_file):
+                with open(window_history_file) as f:
+                    win_history = json.load(f)
+                if "messages" not in win_history:
+                    win_history["messages"] = []
+
+            win_history["messages"].append({
+                "role": "cascade",
+                "content": response_text,
+                "timestamp": timestamp,
+                "trajectory_id": trajectory_id,
+                "execution_id": execution_id,
+            })
+
+            if len(win_history["messages"]) > 200:
+                win_history["messages"] = win_history["messages"][-200:]
+
+            with open(window_history_file, "w") as f:
+                json.dump(win_history, f, indent=2)
+
+            log(f"appended cascade response to window history ({len(win_history['messages'])} total)")
+        except Exception as win_err:
+            log(f"window history append error: {win_err}")
+
+except Exception as hist_err:
+    log(f"history append error: {hist_err}")
 PYEOF
 else
   # Minimal fallback without python

@@ -1,5 +1,11 @@
 {
   "hooks": {
+    "pre_user_prompt": [
+      {
+        "command": "bash HOOKS_DIR/prompt-capture.sh",
+        "show_output": false
+      }
+    ],
     "post_cascade_response": [
       {
         "command": "bash HOOKS_DIR/response-capture.sh",

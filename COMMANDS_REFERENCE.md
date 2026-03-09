@@ -3,12 +3,18 @@
 This document describes the following command IDs as they relate to this repository and the installed Windsurf environment:
 
 - `cascadeCli.sendPrompt`
+- `cascadeCli.executeCommand`
+- `cascadeCli.startWatching`
+- `cascadeCli.stopWatching`
+- `cascadeCli.openNewWindow`
+- `cascadeCli.showStatus`
 - `windsurf.sendTextToChat`
 - `windsurf.triggerCascade`
 - `windsurf.openCascade`
 - `windsurf.cascadePanel.open`
 - `windsurf.addCurrentFileToChat`
 - `windsurf.cascadePanel.focus`
+- `windsurf.prioritized.chat.open`
 - `windsurf.cascade.resetCurrentConversation`
 - `windsurf.cascade.openAgentPicker`
 - `windsurf.cascade.toggleModelSelector`
@@ -43,8 +49,8 @@ These commands are used in a three-part flow:
   - sends prompts to Cascade, or
   - executes arbitrary Windsurf/VS Code commands by ID.
 
-- **Cascade response hook**
-  Writes response data back into `~/.windsurf-cli/response.json`.
+- **Cascade hooks**
+  Capture prompts, responses, and transcripts into `~/.windsurf-cli/`.
 
 Relevant files in this repo:
 
@@ -54,6 +60,99 @@ Relevant files in this repo:
 - `cascade-cli-extension/README.md`
 
 ## Command Reference
+
+---
+
+## `cascadeCli.openNewWindow`
+
+- **Status**
+  Implemented here.
+
+- **Registered by**
+  `cascade-cli-extension/package.json`
+
+- **Implemented in**
+  `cascade-cli-extension/src/extension.js`
+
+- **Purpose**
+  Opens a new Windsurf window at a specified directory, using `vscode.openFolder` with `forceNewWindow: true`.
+
+- **How it works**
+  When executed, the command:
+
+  - prompts for a directory path if not provided as an argument
+  - calls `vscode.commands.executeCommand('vscode.openFolder', uri, { forceNewWindow: true })`
+  - the new window registers itself in `windows.json` on activation
+
+- **Arguments**
+  Optional `dirPath` (string). If omitted, an input box is shown.
+
+- **CLI usage**
+
+  ```bash
+  wsc -N ~/projects/myapp           # open new window at directory
+  wsc -N ~/projects/myapp "fix bug" # open + send prompt
+  ```
+
+- **Side effects**
+  Opens a new Windsurf window. The new window's extension instance registers itself in `windows.json`.
+
+---
+
+## `cascadeCli.executeCommand`
+
+- **Status**
+  Implemented here.
+
+- **Registered by**
+  `cascade-cli-extension/package.json`
+
+- **Implemented in**
+  `cascade-cli-extension/src/extension.js`
+
+- **Purpose**
+  Executes any arbitrary Windsurf/VS Code command by ID, with optional JSON arguments.
+
+- **How it works**
+  When executed, the command:
+
+  - prompts for a command ID
+  - prompts for optional JSON array of arguments
+  - writes a JSON payload to `prompt.json` with `command` and `args` fields
+  - the watcher picks it up and runs `vscode.commands.executeCommand(commandId, ...args)`
+
+- **CLI usage**
+
+  ```bash
+  wsc --exec windsurf.cascadePanel.focus
+  wsc --exec windsurf.openGenericUrl --args '["https://docs.windsurf.com"]'
+  ```
+
+---
+
+## `cascadeCli.startWatching` / `cascadeCli.stopWatching`
+
+- **Status**
+  Implemented here.
+
+- **Purpose**
+  Start or stop the file watcher that monitors `prompt.json` for incoming CLI requests.
+
+- **Notes**
+  If `cascadeCli.autoStart` is `true` (default), watching begins automatically on extension activation. These commands provide manual control.
+
+---
+
+## `cascadeCli.showStatus`
+
+- **Status**
+  Implemented here.
+
+- **Purpose**
+  Displays the current extension status (from `status.json`) in a Windsurf notification.
+
+- **Notes**
+  Also accessible from the status bar item (`wsc: {windowId}`).
 
 ---
 
@@ -436,10 +535,16 @@ Relevant files in this repo:
 ### Commands directly defined by this repo
 
 - `cascadeCli.sendPrompt`
+- `cascadeCli.executeCommand`
+- `cascadeCli.startWatching`
+- `cascadeCli.stopWatching`
+- `cascadeCli.openNewWindow`
+- `cascadeCli.showStatus`
 
 ### Commands actively used by the bridge and therefore integration-verified
 
 - `windsurf.cascadePanel.focus`
+- `windsurf.prioritized.chat.open`
 - `windsurf.cascade.toggleModelSelector`
 
 ### Commands requested here but not verified by current source
@@ -505,7 +610,12 @@ Primary sources used for this document:
 If you are working specifically with this repository, the commands you can rely on most strongly are:
 
 - `cascadeCli.sendPrompt`
+- `cascadeCli.executeCommand`
+- `cascadeCli.openNewWindow`
+- `cascadeCli.startWatching` / `cascadeCli.stopWatching`
+- `cascadeCli.showStatus`
 - `windsurf.cascadePanel.focus`
+- `windsurf.prioritized.chat.open`
 - `windsurf.cascade.toggleModelSelector`
 
-The remaining Windsurf command IDs in this document should be treated as candidate built-ins whose exact behavior must be validated against the user’s installed Windsurf build before depending on them in automation.
+The remaining Windsurf command IDs in this document should be treated as candidate built-ins whose exact behavior must be validated against the user's installed Windsurf build before depending on them in automation.

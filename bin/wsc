@@ -10,6 +10,7 @@ STATUS_FILE="$WSC_DIR/status.json"
 RESPONSE_FILE="$WSC_DIR/response.json"
 MODELS_FILE="$WSC_DIR/models.json"
 WINDOWS_FILE="$WSC_DIR/windows.json"
+RESOLVED_WINDOW=""
 
 # Colors
 RED='\033[0;31m'
@@ -106,6 +107,56 @@ show_request_paths() {
   verbose2 "${DIM}prompt.json: ${PROMPT_FILE}${NC}"
   verbose2 "${DIM}status.json: ${STATUS_FILE}${NC}"
   verbose2 "${DIM}response.json: ${RESPONSE_FILE}${NC}"
+}
+
+# Resolve which window will handle the prompt (mirrors extension's shouldProcessPrompt)
+resolve_target_window() {
+  local target_window="${1:-}"
+  local workspace="$PWD"
+
+  # If explicit -W flag, use that
+  if [[ -n "$target_window" ]]; then
+    echo "$target_window"
+    return
+  fi
+
+  # Read windows registry and find matching window
+  if [[ -f "$WINDOWS_FILE" ]] && command -v python3 &>/dev/null; then
+    python3 - "$WINDOWS_FILE" "$workspace" <<'PYEOF' 2>/dev/null
+import json, sys
+
+registry_path = sys.argv[1]
+workspace = sys.argv[2]
+
+try:
+    with open(registry_path) as f:
+        registry = json.load(f)
+except Exception:
+    sys.exit(0)
+
+keys = list(registry.keys())
+if not keys:
+    sys.exit(0)
+
+# If workspace matches a window's workspace, use that
+for name, info in registry.items():
+    ws = info.get("workspace", "")
+    if ws and workspace.startswith(ws):
+        print(name)
+        sys.exit(0)
+
+# Fallback: first registered window
+print(keys[0])
+PYEOF
+  fi
+}
+
+# Set RESPONSE_FILE to per-window file if window is known
+set_response_file() {
+  local window="$1"
+  if [[ -n "$window" ]]; then
+    RESPONSE_FILE="$WSC_DIR/response-${window}.json"
+  fi
 }
 
 show_payload_preview() {
@@ -417,15 +468,22 @@ open_new_window() {
 
   # Resolve to absolute path
   if [[ "$dir" != /* ]]; then
-    dir="$(cd "$dir" 2>/dev/null && pwd)" || {
-      echo -e "${RED}Directory not found: $1${NC}" >&2
-      return 1
-    }
+    if [[ -d "$dir" ]]; then
+      dir="$(cd "$dir" && pwd)"
+    else
+      # Directory doesn't exist yet — resolve relative to PWD
+      dir="$(cd "$(dirname "$dir")" 2>/dev/null && pwd)/$(basename "$dir")" 2>/dev/null || dir="$PWD/$dir"
+    fi
   fi
 
   if [[ ! -d "$dir" ]]; then
-    echo -e "${RED}Not a directory: $dir${NC}" >&2
-    return 1
+    echo -e "${YELLOW}⚠${NC} Directory does not exist: ${DIM}${dir}${NC}"
+    echo -e "  ${CYAN}Creating it...${NC}"
+    mkdir -p "$dir" || {
+      echo -e "${RED}Failed to create directory: $dir${NC}" >&2
+      return 1
+    }
+    echo -e "  ${GREEN}✓${NC} Created ${DIM}${dir}${NC}"
   fi
 
   echo -e "${CYAN}⧉${NC} Opening new Windsurf window..."
@@ -561,6 +619,10 @@ PYEOF
     write_prompt_json "$prompt" "$model"
   fi
 
+  # Resolve and show which window will handle this
+  RESOLVED_WINDOW=$(resolve_target_window "$window")
+  set_response_file "$RESOLVED_WINDOW"
+
   if [[ "$model_only" == "true" ]]; then
     echo -e "${GREEN}✓${NC} Model selection sent"
     echo -e "  ${DIM}Model: ${model}${NC}"
@@ -572,7 +634,11 @@ PYEOF
     show_request_paths
     show_payload_preview "Prompt preview" "$prompt"
   fi
-  [[ -n "$window" ]] && echo -e "  ${DIM}Window: ${window}${NC}"
+  if [[ -n "$RESOLVED_WINDOW" ]]; then
+    echo -e "  ${CYAN}Window: ${RESOLVED_WINDOW}${NC}"
+  else
+    echo -e "  ${YELLOW}Window: (unknown — no windows registered)${NC}"
+  fi
   echo -e "  ${DIM}Waiting for extension to pick it up...${NC}"
 }
 
@@ -628,12 +694,20 @@ PYEOF
     exit 1
   fi
 
+  # Resolve and show which window will handle this
+  RESOLVED_WINDOW=$(resolve_target_window "$window")
+  set_response_file "$RESOLVED_WINDOW"
+
   echo -e "${GREEN}✓${NC} Command sent to Windsurf"
   echo -e "  ${DIM}Command: ${command_id}${NC}"
   echo -e "  ${DIM}Args: ${args_json}${NC}"
   show_request_paths
   show_payload_preview "Args preview" "$args_json"
-  [[ -n "$window" ]] && echo -e "  ${DIM}Window: ${window}${NC}"
+  if [[ -n "$RESOLVED_WINDOW" ]]; then
+    echo -e "  ${CYAN}Window: ${RESOLVED_WINDOW}${NC}"
+  else
+    echo -e "  ${YELLOW}Window: (unknown — no windows registered)${NC}"
+  fi
   echo -e "  ${DIM}Waiting for extension to pick it up...${NC}"
 }
 
@@ -772,7 +846,7 @@ wait_for_processing() {
           else
             echo -e "${GREEN}✓${NC} Request accepted by extension"
           fi
-          [[ -n "$processed_by" ]] && verbose "${BLUE}ℹ${NC} Processed by window: ${processed_by}"
+          [[ -n "$processed_by" ]] && echo -e "  ${CYAN}Processed by: ${processed_by}${NC}"
           [[ -n "$processed_at" ]] && verbose2 "${DIM}Processed at: ${processed_at}${NC}"
           if [[ -n "$result" ]]; then
             echo -e "${BLUE}Result:${NC}"
@@ -784,7 +858,7 @@ wait_for_processing() {
         echo -e "${RED}✗${NC} ${label} failed"
         [[ -n "$command" ]] && echo -e "  ${DIM}Command: ${command}${NC}"
         [[ -n "$error" ]] && echo -e "  ${RED}${error}${NC}"
-        [[ -n "$processed_by" ]] && verbose "${BLUE}ℹ${NC} Processed by window: ${processed_by}"
+        [[ -n "$processed_by" ]] && echo -e "  ${CYAN}Processed by: ${processed_by}${NC}"
         return 1
       fi
     fi
@@ -932,6 +1006,10 @@ if [[ -n "$NEW_WINDOW_DIR" ]]; then
   # Force new conversation in the new window
   NEW_CONVERSATION=true
 fi
+
+# Resolve target window early so RESPONSE_FILE uses per-window path
+RESOLVED_WINDOW=$(resolve_target_window "$WINDOW")
+set_response_file "$RESOLVED_WINDOW"
 
 if [[ "$ACCEPT_ALL_ONCE" == true ]]; then
   rm -f "$RESPONSE_FILE"

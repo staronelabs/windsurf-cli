@@ -66,6 +66,20 @@ function formatError(err) {
   return String(err && (err.message || err) ? err.message || err : err).substring(0, 200);
 }
 
+function writeActiveWindow() {
+  try {
+    const activeWindowPath = path.join(promptDir, "active-window.json");
+    fs.writeFileSync(activeWindowPath, JSON.stringify({
+      windowId,
+      workspace: getWorkspacePath(),
+      pid: process.pid,
+      timestamp: new Date().toISOString(),
+    }, null, 2));
+  } catch {
+    // Non-critical
+  }
+}
+
 function writeStatus(status, message) {
   const statusPath = path.join(promptDir, STATUS_FILE);
   const data = {
@@ -81,19 +95,12 @@ function writeStatus(status, message) {
 function writeModelsFile() {
   const modelsPath = path.join(promptDir, MODELS_FILE);
   const models = [
-    "SWE-1.5",
-    "SWE-1",
-    "Claude 4 Sonnet",
-    "Claude 4 Sonnet (Thinking)",
-    "Claude 4 Opus",
-    "Claude 4 Opus (Thinking)",
-    "Claude 3.5 Sonnet",
-    "GPT-4o",
-    "GPT-4.1",
-    "GPT-4.1 mini",
-    "Gemini 2.5 Pro",
-    "o3",
-    "o4-mini",
+    "Claude Opus 4.6 Thinking",
+    "Claude Sonnet 4.6 Thinking",
+    "Claude Sonnet 4.5",
+    "GPT-5.4",
+    "GPT-5.3-Codex X-High",
+    "SWE-1.5 Fast",
   ];
   fs.writeFileSync(modelsPath, JSON.stringify({ models }, null, 2));
 }
@@ -558,18 +565,57 @@ async function focusCascadeAndSend(promptText, model, newConversation, autoAccep
   return await tryProgrammaticSend(promptText);
 }
 
+// Focus the correct Windsurf window by windowId before sending keystrokes.
+// Uses System Events (reliable) instead of tell application "Windsurf" (not scriptable).
+async function focusCorrectWindow() {
+  const escapedWinId = windowId.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  const script = `
+    tell application "System Events"
+      tell process "Windsurf"
+        set targetFound to false
+        set winNames to {}
+        set winCount to count of windows
+        repeat with i from 1 to winCount
+          set wName to name of window i
+          set end of winNames to wName
+          if wName contains "${escapedWinId}" then
+            -- Perform AXRaise to bring this window to front
+            perform action "AXRaise" of window i
+            set targetFound to true
+            exit repeat
+          end if
+        end repeat
+        set frontmost to true
+      end tell
+    end tell
+    tell application "Windsurf" to activate
+    delay 0.3
+    return "targetFound:" & (targetFound as string) & "|count:" & (winCount as string)
+  `;
+  
+  const result = await runAppleScriptForOutput(script, "focus-window");
+  _log(`[focus] Window targeting result: ${result}`);
+  
+  if (result && result.includes("targetFound:true")) {
+    _log(`[focus] Correct window focused: ${windowId}`);
+    return true;
+  } else {
+    _log(`[focus] WARNING: Could not find window containing "${windowId}". Result: ${result}`);
+    // Fallback: just activate Windsurf (better than nothing)
+    await _runAppleScript(`tell application "Windsurf" to activate\ndelay 0.3`, null, "focus-fallback");
+    return false;
+  }
+}
+
 // Phase 1a: Open NEW Cascade conversation via Cmd+Shift+L (proven to focus input)
 async function openNewCascade() {
   _log("[focus] Opening new conversation via Cmd+Shift+L");
+
+  // Ensure correct window has OS focus first
+  await focusCorrectWindow();
+
   const script = `
-    tell application "Windsurf"
-      activate
-    end tell
-    delay 0.3
     tell application "System Events"
-      tell process "Windsurf"
-        set frontmost to true
-      end tell
       keystroke "l" using {command down, shift down}
     end tell
   `;
@@ -611,7 +657,8 @@ async function focusExistingCascade() {
 async function selectModel(model) {
   _log(`[model] Selecting: ${model}`);
 
-  // Toggle the model selector dropdown via VS Code API
+  // Step 1: Toggle the model selector dropdown via VS Code API
+  // (API always runs in the correct window's extension host — no OS focus needed)
   try {
     await vscode.commands.executeCommand("windsurf.cascade.toggleModelSelector");
     _log("[model] OK: toggleModelSelector opened");
@@ -621,33 +668,31 @@ async function selectModel(model) {
     return;
   }
 
-  await sleep(500); // wait for dropdown to open
+  await sleep(400); // wait for dropdown to start rendering
 
-  // Type model name to filter, arrow down to highlight first match, Enter to select
+  // Step 2: NOW focus the correct window at OS level so keystrokes go there
+  await focusCorrectWindow();
+  await sleep(300); // let OS focus settle
+
+  // Step 3: Type model name to filter, arrow down to highlight, Enter to select
   const escaped = model.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-  const script = `
-    tell application "Windsurf"
-      activate
-    end tell
-    delay 0.2
+  const typeScript = `
     tell application "System Events"
       tell process "Windsurf"
-        set frontmost to true
+        -- Type model name to filter the dropdown
+        keystroke "${escaped}"
+        delay 0.5
+
+        -- Down arrow to highlight the first filtered result
+        key code 125
+        delay 0.2
+
+        -- Enter to confirm selection
+        key code 36
       end tell
-
-      -- Type model name to filter the dropdown
-      keystroke "${escaped}"
-      delay 0.5
-
-      -- Down arrow to highlight the first filtered result
-      key code 125
-      delay 0.2
-
-      -- Enter to confirm selection
-      key code 36
     end tell
   `;
-  await _runAppleScript(script, null, "model-select");
+  await _runAppleScript(typeScript, null, "model-select");
   await sleep(400);
   _log(`[model] Selected: ${model}`);
 }
@@ -657,21 +702,15 @@ async function pasteAndSubmit(promptText) {
   const tmpFile = path.join(os.tmpdir(), "wsc-prompt.txt");
   fs.writeFileSync(tmpFile, promptText);
 
+  // Ensure correct window has OS focus before pasting
+  await focusCorrectWindow();
+
   const script = `
     set oldClip to the clipboard
     set promptText to (read POSIX file "${tmpFile}")
     set the clipboard to promptText
 
-    tell application "Windsurf"
-      activate
-    end tell
-    delay 0.2
-
     tell application "System Events"
-      tell process "Windsurf"
-        set frontmost to true
-      end tell
-
       -- Paste prompt into the focused Cascade input
       keystroke "v" using command down
       delay 0.3
@@ -811,6 +850,10 @@ async function processPromptFile() {
   const action = data.command ? `command ${data.command}` : (data.modelOnly ? "model selection" : "prompt");
   _log(`[process] Processing ${action} from ${data.source || "unknown"}`);
   writeStatus("processing", data.command ? `Executing command ${data.command}...` : (data.modelOnly ? "Selecting model..." : "Sending prompt to Cascade..."));
+
+  // Write active-window marker so hooks can write per-window files
+  writeActiveWindow();
+
   statusBarItem.text = "$(loading~spin) Cascade CLI: Sending...";
 
   try {
@@ -1041,6 +1084,18 @@ function activate(context) {
         vscode.window.showInformationMessage(
           `Cascade CLI [${windowId}]: No status available`
         );
+      }
+    })
+  );
+
+  // Write active-window on activation and whenever this window gains focus
+  // so hooks (pre_user_prompt, post_cascade_response) know which window is active
+  writeActiveWindow();
+  context.subscriptions.push(
+    vscode.window.onDidChangeWindowState((state) => {
+      if (state.focused) {
+        writeActiveWindow();
+        _log("[focus] Window focused — updated active-window.json");
       }
     })
   );

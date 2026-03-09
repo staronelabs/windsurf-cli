@@ -54,55 +54,77 @@ fi
 
 # 3. Install hooks
 echo -e "${BLUE}[3/5]${NC} Installing Cascade hooks..."
-cp "$SCRIPT_DIR/hooks/response-capture.sh" "$HOOKS_DIR/response-capture.sh"
-chmod +x "$HOOKS_DIR/response-capture.sh"
+for hook in prompt-capture.sh response-capture.sh log-prompt.sh log-transcript.sh; do
+  if [[ -f "$SCRIPT_DIR/hooks/$hook" ]]; then
+    cp "$SCRIPT_DIR/hooks/$hook" "$HOOKS_DIR/$hook"
+    chmod +x "$HOOKS_DIR/$hook"
+    echo -e "  ${GREEN}✓${NC} $hook"
+  fi
+done
 
 # Generate hooks.json with correct path
 HOOKS_JSON_USER="$HOME/.codeium/windsurf/hooks.json"
 mkdir -p "$(dirname "$HOOKS_JSON_USER")"
 
-# Check if hooks.json already exists and merge
+# Build or merge hooks.json with all our hooks
 if [[ -f "$HOOKS_JSON_USER" ]]; then
   echo -e "${DIM}  Existing hooks.json found, merging...${NC}"
-  if command -v python3 &>/dev/null; then
-    python3 -c "
-import json
+fi
 
-# Read existing
-with open('$HOOKS_JSON_USER') as f:
-    existing = json.load(f)
+if command -v python3 &>/dev/null; then
+  python3 -c "
+import json, os
 
-# Add our hook
+hooks_json_path = '$HOOKS_JSON_USER'
+hooks_dir = '$HOOKS_DIR'
+
+# Read existing or start fresh
+existing = {}
+if os.path.exists(hooks_json_path):
+    with open(hooks_json_path) as f:
+        existing = json.load(f)
+
 hooks = existing.get('hooks', {})
-post_resp = hooks.get('post_cascade_response', [])
 
-# Check if our hook already exists
-our_cmd = 'bash $HOOKS_DIR/response-capture.sh'
-already = any(h.get('command') == our_cmd for h in post_resp)
+# Define all hooks we want to register
+our_hooks = {
+    'pre_user_prompt': [
+        f'bash {hooks_dir}/prompt-capture.sh',
+        f'bash {hooks_dir}/log-prompt.sh',
+    ],
+    'post_cascade_response': [
+        f'bash {hooks_dir}/response-capture.sh',
+    ],
+    'post_cascade_response_with_transcript': [
+        f'bash {hooks_dir}/log-transcript.sh',
+    ],
+}
 
-if not already:
-    post_resp.append({
-        'command': our_cmd,
-        'show_output': False
-    })
-    hooks['post_cascade_response'] = post_resp
-    existing['hooks'] = hooks
-    with open('$HOOKS_JSON_USER', 'w') as f:
-        json.dump(existing, f, indent=2)
-    print('  Added response capture hook')
-else:
-    print('  Hook already installed')
+for event, commands in our_hooks.items():
+    event_hooks = hooks.get(event, [])
+    for cmd in commands:
+        if not any(h.get('command') == cmd for h in event_hooks):
+            event_hooks.append({'command': cmd, 'show_output': False})
+            print(f'  Added {event}: {cmd.split("/")[-1]}')
+    hooks[event] = event_hooks
+
+existing['hooks'] = hooks
+with open(hooks_json_path, 'w') as f:
+    json.dump(existing, f, indent=2)
 "
-  fi
 else
   cat > "$HOOKS_JSON_USER" <<EOF
 {
   "hooks": {
+    "pre_user_prompt": [
+      { "command": "bash $HOOKS_DIR/prompt-capture.sh", "show_output": false },
+      { "command": "bash $HOOKS_DIR/log-prompt.sh", "show_output": false }
+    ],
     "post_cascade_response": [
-      {
-        "command": "bash $HOOKS_DIR/response-capture.sh",
-        "show_output": false
-      }
+      { "command": "bash $HOOKS_DIR/response-capture.sh", "show_output": false }
+    ],
+    "post_cascade_response_with_transcript": [
+      { "command": "bash $HOOKS_DIR/log-transcript.sh", "show_output": false }
     ]
   }
 }
@@ -135,7 +157,7 @@ echo -e "${GREEN}━━━ Installation Complete ━━━${NC}"
 echo ""
 echo -e "${BOLD}Components installed:${NC}"
 echo -e "  ${GREEN}✓${NC} CLI tool:   $BIN_DIR/wsc"
-echo -e "  ${GREEN}✓${NC} Hooks:      $HOOKS_DIR/response-capture.sh"
+echo -e "  ${GREEN}✓${NC} Hooks:      $HOOKS_DIR/ (4 scripts)"
 echo -e "  ${GREEN}✓${NC} Hooks cfg:  $HOOKS_JSON_USER"
 echo -e "  ${GREEN}✓${NC} Extension:  $EXT_TARGET"
 echo ""

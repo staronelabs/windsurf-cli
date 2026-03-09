@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "pre_user_prompt": [
+      {
+        "command": "bash HOOKS_DIR/log-prompt.sh",
+        "show_output": false
+      }
+    ],
+    "post_cascade_response_with_transcript": [
+      {
+        "command": "bash HOOKS_DIR/log-transcript.sh",
+        "show_output": false
+      }
+    ]
+  }
+}
