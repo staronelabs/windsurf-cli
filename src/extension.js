@@ -636,7 +636,8 @@ async function focusCascadeAndSend(promptText, model, newConversation, autoAccep
     }
 
     // Phase 3: Paste prompt + submit
-    const result = await pasteAndSubmit(promptText);
+    const refocusChat = !wantNew && cascadeSessionActive;
+    const result = await pasteAndSubmit(promptText, refocusChat);
     if (result) {
       cascadeSessionActive = true;
       recordPromptSent();
@@ -695,6 +696,36 @@ async function focusCorrectWindow() {
   }
 }
 
+// Idempotent panel open — uses API command that won't toggle
+async function ensureCascadePanelOpen() {
+  _log("[focus] Ensuring Cascade panel is open (idempotent)");
+  try {
+    await vscode.commands.executeCommand("windsurf.cascadePanel.open");
+    _log("[focus] OK: cascadePanel.open (idempotent)");
+    await sleep(300);
+    return true;
+  } catch (e) {
+    _log(`[focus] FAIL: cascadePanel.open — ${String(e.message || e).substring(0, 100)}`);
+  }
+
+  // Fallback: editor-focus + Cmd+Shift+L
+  _log("[focus] Fallback: editor focus + Cmd+Shift+L");
+  try {
+    await vscode.commands.executeCommand("workbench.action.focusActiveEditorGroup");
+    await sleep(200);
+  } catch (e) {
+    _log(`[focus] WARN: focusActiveEditorGroup — ${String(e.message || e).substring(0, 100)}`);
+  }
+  const script = `
+    tell application "System Events"
+      keystroke "l" using {command down, shift down}
+    end tell
+  `;
+  const ok = await _runAppleScript(script, null, "open-panel-fallback");
+  if (ok) await sleep(800);
+  return ok;
+}
+
 // Phase 1a: Open NEW Cascade conversation via Cmd+Shift+L (proven to focus input)
 async function openNewCascade() {
   _log("[focus] Opening new conversation via Cmd+Shift+L");
@@ -702,6 +733,15 @@ async function openNewCascade() {
   // Ensure correct window has OS focus first
   await focusCorrectWindow();
 
+  // Focus editor first to guarantee the toggle opens (not closes) the panel
+  try {
+    await vscode.commands.executeCommand("workbench.action.focusActiveEditorGroup");
+    await sleep(200);
+  } catch (e) {
+    _log(`[focus] WARN: focusActiveEditorGroup — ${String(e.message || e).substring(0, 100)}`);
+  }
+
+  // Now Cmd+Shift+L safely opens a new conversation
   const script = `
     tell application "System Events"
       keystroke "l" using {command down, shift down}
@@ -715,30 +755,7 @@ async function openNewCascade() {
 // Phase 1b: Focus EXISTING Cascade conversation
 async function focusExistingCascade() {
   _log("[focus] Focusing existing conversation");
-
-  // First ensure panel is visible via VS Code API
-  try {
-    await vscode.commands.executeCommand("windsurf.cascadePanel.focus");
-    _log("[focus] OK: cascadePanel.focus (panel visible)");
-  } catch (e) {
-    _log(`[focus] FAIL: cascadePanel.focus — ${String(e.message || e).substring(0, 100)}`);
-  }
-  await sleep(200);
-
-  // Then use prioritized.chat.open via VS Code API to focus the INPUT
-  // (API calls typically don't toggle like keyboard shortcuts do)
-  try {
-    await vscode.commands.executeCommand("windsurf.prioritized.chat.open");
-    _log("[focus] OK: prioritized.chat.open (input focused)");
-    await sleep(400);
-    return true;
-  } catch (e) {
-    _log(`[focus] FAIL: prioritized.chat.open — ${String(e.message || e).substring(0, 100)}`);
-  }
-
-  // Fallback: use Cmd+Shift+L (creates new tab but at least works)
-  _log("[focus] Falling back to Cmd+Shift+L");
-  return await openNewCascade();
+  return await ensureCascadePanelOpen();
 }
 
 // Phase 2: Select model AFTER Cascade panel is open and focused
@@ -786,12 +803,24 @@ async function selectModel(model) {
 }
 
 // Phase 3: Paste prompt text and submit with Enter
-async function pasteAndSubmit(promptText) {
+async function pasteAndSubmit(promptText, refocusChat) {
   const tmpFile = path.join(os.tmpdir(), "wsc-prompt.txt");
   fs.writeFileSync(tmpFile, promptText);
 
   // Ensure correct window has OS focus before pasting
   await focusCorrectWindow();
+
+  // Re-focus panel before paste when reusing existing conversation
+  // (focusCorrectWindow resets internal focus to the editor)
+  if (refocusChat) {
+    try {
+      await vscode.commands.executeCommand("windsurf.cascadePanel.focus");
+      _log("[paste] OK: cascadePanel.focus (re-focused chat input)");
+      await sleep(300);
+    } catch (e) {
+      _log(`[paste] WARN: cascadePanel.focus — ${String(e.message || e).substring(0, 100)}`);
+    }
+  }
 
   const script = `
     set oldClip to the clipboard
