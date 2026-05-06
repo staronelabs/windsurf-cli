@@ -104,11 +104,15 @@ source ~/.zshrc
 ### Uninstall
 
 ```bash
-rm ~/.local/bin/wsc
-rm -rf ~/.windsurf/extensions/cascade-cli-0.1.0
-rm -rf ~/.windsurf-cli
-# Optionally remove the hook from ~/.codeium/windsurf/hooks.json
+./install.sh -u    # or --uninstall
 ```
+
+This removes:
+- CLI tool from `~/.local/bin/wsc`
+- Extension symlink from `~/.windsurf/extensions/cascade-cli-0.1.0`
+- All files in `~/.windsurf-cli/`
+- Hooks from `~/.codeium/windsurf/hooks.json`
+- Optionally removes PATH export from `~/.zshrc` (with confirmation)
 
 ## Usage
 

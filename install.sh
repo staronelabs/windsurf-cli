@@ -17,6 +17,115 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WSC_DIR="$HOME/.windsurf-cli"
 BIN_DIR="$HOME/.local/bin"
 HOOKS_DIR="$WSC_DIR/hooks"
+HOOKS_JSON_USER="$HOME/.codeium/windsurf/hooks.json"
+
+# Parse arguments
+UNINSTALL=false
+for arg in "$@"; do
+  case $arg in
+    -u|--uninstall)
+      UNINSTALL=true
+      shift
+      ;;
+  esac
+done
+
+# Uninstall function
+uninstall() {
+  echo -e "${BOLD}━━━ Windsurf Cascade CLI Uninstaller ━━━${NC}"
+  echo ""
+
+  local removed_any=false
+
+  # Remove CLI tool
+  if [[ -f "$BIN_DIR/wsc" ]]; then
+    rm -f "$BIN_DIR/wsc"
+    echo -e "${GREEN}✓${NC} Removed CLI: $BIN_DIR/wsc"
+    removed_any=true
+  fi
+
+  # Remove extension symlink
+  local ext_dir="$HOME/.windsurf/extensions"
+  if [[ ! -d "$ext_dir" ]]; then
+    ext_dir="$HOME/.vscode/extensions"
+  fi
+  local ext_target="$ext_dir/cascade-cli-0.1.0"
+  if [[ -L "$ext_target" || -d "$ext_target" ]]; then
+    rm -rf "$ext_target"
+    echo -e "${GREEN}✓${NC} Removed extension: $ext_target"
+    removed_any=true
+  fi
+
+  # Remove windsurf-cli directory
+  if [[ -d "$WSC_DIR" ]]; then
+    rm -rf "$WSC_DIR"
+    echo -e "${GREEN}✓${NC} Removed directory: $WSC_DIR"
+    removed_any=true
+  fi
+
+  # Remove hooks from hooks.json
+  if [[ -f "$HOOKS_JSON_USER" ]] && command -v python3 &>/dev/null; then
+    python3 -c "
+import json, os
+
+hooks_json_path = '$HOOKS_JSON_USER'
+hooks_dir = '$HOOKS_DIR'
+
+if not os.path.exists(hooks_json_path):
+    exit(0)
+
+with open(hooks_json_path) as f:
+    data = json.load(f)
+
+hooks = data.get('hooks', {})
+our_hook_commands = [
+    f'bash {hooks_dir}/prompt-capture.sh',
+    f'bash {hooks_dir}/response-capture.sh',
+    f'bash {hooks_dir}/log-prompt.sh',
+    f'bash {hooks_dir}/log-transcript.sh',
+]
+
+removed_count = 0
+for event, event_hooks in hooks.items():
+    original_count = len(event_hooks)
+    hooks[event] = [h for h in event_hooks if h.get('command') not in our_hook_commands]
+    removed_count += original_count - len(hooks[event])
+
+if removed_count > 0:
+    with open(hooks_json_path, 'w') as f:
+        json.dump(data, f, indent=2)
+    print(f'  Removed {removed_count} hook(s) from hooks.json')
+"
+    echo -e "${GREEN}✓${NC} Removed hooks from: $HOOKS_JSON_USER"
+    removed_any=true
+  fi
+
+  # Optionally remove PATH from shell config
+  if grep -q "# Windsurf Cascade CLI" "$HOME/.zshrc" 2>/dev/null; then
+    read -rp "Remove PATH export from ~/.zshrc? [Y/n] " remove_path
+    if [[ "${remove_path:-Y}" =~ ^[Yy]$ ]]; then
+      # Remove the lines we added
+      sed -i '' '/# Windsurf Cascade CLI/d' "$HOME/.zshrc"
+      sed -i '' '/export PATH="\$HOME\/.local\/bin:\$PATH"/d' "$HOME/.zshrc"
+      echo -e "${GREEN}✓${NC} Removed PATH from ~/.zshrc"
+      removed_any=true
+    fi
+  fi
+
+  echo ""
+  if [[ "$removed_any" == true ]]; then
+    echo -e "${GREEN}━━━ Uninstall Complete ━━━${NC}"
+    echo -e "${DIM}Restart Windsurf to complete uninstallation.${NC}"
+  else
+    echo -e "${YELLOW}Nothing to uninstall.${NC}"
+  fi
+  exit 0
+}
+
+# Run uninstall if requested
+if [[ "$UNINSTALL" == true ]]; then
+  uninstall
+fi
 
 echo -e "${BOLD}━━━ Windsurf Cascade CLI Installer ━━━${NC}"
 echo ""
