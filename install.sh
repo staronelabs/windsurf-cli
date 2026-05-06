@@ -105,7 +105,7 @@ for event, commands in our_hooks.items():
     for cmd in commands:
         if not any(h.get('command') == cmd for h in event_hooks):
             event_hooks.append({'command': cmd, 'show_output': False})
-            print(f'  Added {event}: {cmd.split("/")[-1]}')
+            print(f'  Added {event}: {cmd.split(\"/\")[-1]}')
     hooks[event] = event_hooks
 
 existing['hooks'] = hooks
