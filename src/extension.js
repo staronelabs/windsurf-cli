@@ -101,6 +101,7 @@ function writeModelsFile() {
     "GPT-5.4",
     "GPT-5.3-Codex X-High",
     "SWE-1.5 Fast",
+    "SWE-1.6",
   ];
   fs.writeFileSync(modelsPath, JSON.stringify({ models }, null, 2));
 }
